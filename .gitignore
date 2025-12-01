@@ -1,0 +1,45 @@
+# --- CARPETAS DE COMPILACIÓN ---
+build/
+cmake-build-debug/
+bin/
+lib/
+out/
+
+# --- ARCHIVOS INTERMEDIOS Y BINARIOS ---
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+# El ejecutable principal
+MiniSQL
+a.out
+
+# --- BASE DE DATOS (Persistencia Local) ---
+# Ignoramos todos los .txt porque son las tablas generadas y el schema
+*.txt
+
+# --- EXCEPCIONES (Archivos que SÍ queremos subir) ---
+# ¡CRÍTICO! Nunca ignorar el CMakeLists.txt aunque sea .txt
+!CMakeLists.txt
+# Si tienes algún README o documentación en texto
+!README.txt
+
+# --- SCRIPTS SQL ---
+# Asegurarnos de que los scripts de prueba SIEMPRE se suban
+!*.sql
+
+# --- ARCHIVOS GENERADOS POR CMAKE/ANTLR (Si se generan en la raíz) ---
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+# Excepción: Scripts de cmake propios (como FindANTLR.cmake si lo tienes descargado)
+!FindANTLR.cmake
+
+# --- IDEs Y SISTEMA ---
+.vscode/
+.idea/
+.DS_Store
+*.swp
