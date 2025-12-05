@@ -165,6 +165,7 @@ public:
         visitChildren(ctx);
 
         irBuilder->CreateRet(ConstantInt::get(Type::getInt32Ty(context), 0));
+        outs() << *module;
         return std::any();
     }
 
@@ -392,5 +393,102 @@ public:
         return std::any();
     }
 
+    // En SQLMiniDriver.h
+    virtual std::any visitFunctionCall(SQLMiniParser::FunctionCallContext *ctx) override {
+        // Lógica para la función IF (MySQL)
+        // Sintaxis: IF(condicion, resultado_verdadero, resultado_falso)
+
+        if (ctx->IF_FUNC()) {
+            auto comparisonCtx = ctx->comparison();
+            auto trueDatoCtx = ctx->dato(1);
+            auto falseDatoCtx = ctx->dato(2);
+
+            // 1. Manejar la Comparación (Condición)
+            // Necesitarás una función auxiliar que compile la `comparison` a un I1 (booleano)
+            Value* condition = compileComparison(comparisonCtx); 
+
+            // 2. Generar bloques de control de flujo
+            Function *currentFunc = irBuilder->GetInsertBlock()->getParent();
+            BasicBlock *trueBB = BasicBlock::Create(context, "if_true", currentFunc);
+            BasicBlock *falseBB = BasicBlock::Create(context, "if_false", currentFunc);
+            BasicBlock *mergeBB = BasicBlock::Create(context, "if_merge", currentFunc);
+
+            irBuilder->CreateCondBr(condition, trueBB, falseBB);
+
+            // 3. Generar rama VERDADERA (TRUE)
+            irBuilder->SetInsertPoint(trueBB);
+            Value* trueVal = compileDato(trueDatoCtx); // Función auxiliar para compilar el dato
+            trueBB = irBuilder->GetInsertBlock(); // Actualizar bloque de salida
+            irBuilder->CreateBr(mergeBB);
+
+            // 4. Generar rama FALSA (FALSE)
+            irBuilder->SetInsertPoint(falseBB);
+            Value* falseVal = compileDato(falseDatoCtx); 
+            falseBB = irBuilder->GetInsertBlock(); // Actualizar bloque de salida
+            irBuilder->CreateBr(mergeBB);
+
+            // 5. Generar bloque de UNIÓN (MERGE) con PHINode
+            irBuilder->SetInsertPoint(mergeBB);
+            // Asumimos que trueVal y falseVal tienen el mismo tipo (simplificación)
+            PHINode *phi = irBuilder->CreatePHI(trueVal->getType(), 2, "if_result");
+            phi->addIncoming(trueVal, trueBB);
+            phi->addIncoming(falseVal, falseBB);
+
+            return (Value*)phi;
+        }
+        return std::any(); // O manejar error
+    }
+
     virtual std::any visitDrop(SQLMiniParser::DropContext *ctx) { return std::any(); }
+
+    // En SQLMiniDriver.h
+    virtual std::any visitForLoop(SQLMiniParser::ForLoopContext *ctx) override {
+        // Sintaxis: FOR i = 1 TO 100 DO INSERT... END FOR;
+        std::string varName = ctx->ID()->getText(); // Nombre de la variable (e.g., 'i')
+        int startVal = std::stoi(ctx->VINT(0)->getText());
+        int endVal = std::stoi(ctx->VINT(1)->getText());
+
+        Function *currentFunc = irBuilder->GetInsertBlock()->getParent();
+
+        // 1. Inicialización: Crear una variable ALLOCA para el contador 'i'
+        Value* loopVar = irBuilder->CreateAlloca(Type::getInt32Ty(context), nullptr, varName);
+        Value* startConstant = ConstantInt::get(Type::getInt32Ty(context), startVal);
+        irBuilder->CreateStore(startConstant, loopVar);
+
+        // 2. Bloques de control
+        BasicBlock *loopCond = BasicBlock::Create(context, "for_cond", currentFunc);
+        BasicBlock *loopBody = BasicBlock::Create(context, "for_body", currentFunc);
+        BasicBlock *loopExit = BasicBlock::Create(context, "for_exit", currentFunc);
+
+        irBuilder->CreateBr(loopCond); // Saltar a la condición
+
+        // 3. Condición del bucle (loop_cond)
+        irBuilder->SetInsertPoint(loopCond);
+        Value* currentVal = irBuilder->CreateLoad(Type::getInt32Ty(context), loopVar);
+        Value* endConstant = ConstantInt::get(Type::getInt32Ty(context), endVal);
+        // Comparación: i <= 100
+        Value* condition = irBuilder->CreateICmpSLE(currentVal, endConstant, "loop_cond_val");
+        irBuilder->CreateCondBr(condition, loopBody, loopExit);
+
+        // 4. Cuerpo del bucle (loop_body)
+        irBuilder->SetInsertPoint(loopBody);
+
+        // Ejecutar el INSERT
+        // **IMPORTANTE**: Necesitas sobrecargar `visitInsert` o encapsular su lógica 
+        // para que tome el contexto del insert dentro del FOR.
+        // Por simplicidad: Llama a la lógica de `insert` directamente o haz un `visitInsert(ctx->insert())`.
+        this->visitInsert(ctx->insert()); 
+
+        // 5. Incremento (i = i + 1)
+        Value* stepVal = ConstantInt::get(Type::getInt32Ty(context), 1);
+        Value* nextVal = irBuilder->CreateAdd(currentVal, stepVal, "next_i");
+        irBuilder->CreateStore(nextVal, loopVar);
+
+        irBuilder->CreateBr(loopCond); // Regresar a la condición
+
+        // 6. Fin del bucle (loop_exit)
+        irBuilder->SetInsertPoint(loopExit);
+
+        return std::any();
+    }
 };
