@@ -1,5 +1,4 @@
 -- TEST 1: Tipos de Datos
--- Ahora soporta sintaxis estándar: nombre_columna tipo_dato
 
 CREATE TABLE inventario (
     id int,

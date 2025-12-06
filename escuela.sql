@@ -1,9 +1,9 @@
--- 1. Crear tabla Estudiantes (Sintaxis: TIPO NOMBRE)
+-- 1. Crear tabla Estudiantes
 create table estudiantes (
-    int id,
-    varchar(50) nombre_completo,
-    int edad,
-    boolean becado
+    id int,
+    nombre_completo varchar(50),
+    edad int,
+    becado boolean
 );
 
 -- 2. Insertar datos (Sin espacios en los strings)
@@ -13,10 +13,11 @@ insert into estudiantes values (102, 'Carlos_Ruiz', 21, true);
 insert into estudiantes values (103, 'Ana_Solis', 20, false);
 
 -- 3. Crear tabla Cursos
+-- CORREGIDO: Sintaxis NOMBRE TIPO
 create table cursos (
-    int codigo,
-    varchar(50) nombre_curso,
-    decimal(4,2) creditos
+    codigo int,
+    nombre_curso varchar(50),
+    creditos decimal(4,2)
 );
 
 insert into cursos values (10, 'Compiladores', 4.50);

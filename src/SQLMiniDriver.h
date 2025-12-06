@@ -20,6 +20,7 @@
 #include <fstream> 
 #include <sstream> 
 #include <algorithm> 
+#include <cstdio> // Necesario para std::remove (borrar archivos)
 
 using namespace antlr4;
 using namespace llvm;
@@ -47,12 +48,10 @@ class SQLMiniDriver : public SQLMiniBaseVisitor {
 private:
     std::map<std::string, TableInfo> symbolTable; 
     
-    // --- VARIABLES DE CONTEXTO (NUEVO) ---
-    // Estas variables permiten a compileComparison acceder a los datos de la fila actual
+    // Variables de contexto para SELECT
     std::vector<Value*> activeReadBuffers;
     TableInfo* activeTableInfo = nullptr;
 
-    // Helper case-insensitive
     bool iequals(const string& a, const string& b) {
         if (a.size() != b.size()) return false;
         for (size_t i = 0; i < a.size(); ++i)
@@ -75,7 +74,7 @@ private:
         switch (dt) {
             case INT_T: return Type::getInt32Ty(context);
             case DECIMAL_T: return Type::getDoubleTy(context);
-            case BOOLEAN_T: return Type::getInt32Ty(context); // i32 para evitar corrupción
+            case BOOLEAN_T: return Type::getInt32Ty(context); // i32 para evitar corrupción de memoria
             case VARCHAR_T: return PointerType::get(context, 0); 
         }
         return Type::getVoidTy(context);
@@ -120,30 +119,26 @@ private:
         } else if (ctx->STRING() != nullptr) {
             std::string content = valText.substr(1, valText.size()-2); 
             return irBuilder->CreateGlobalStringPtr(content);
-        } else if (ctx->bool_() != nullptr) { 
+        } else if (ctx->bool_() != nullptr) { // FIX: Usamos bool_() con guion bajo
             bool isTrue = iequals(valText, "true");
             return ConstantInt::get(Type::getInt32Ty(context), isTrue);
         }
         throw std::runtime_error("Unsupported dato type: " + valText);
     }
     
-    // --- LÓGICA REAL DE COMPARACIÓN (ACTUALIZADO) ---
     Value* compileComparison(SQLMiniParser::ComparisonContext *ctx) {
-        // Verificar que tenemos contexto de lectura
         if (!activeTableInfo || activeReadBuffers.empty()) {
              Value* msg = irBuilder->CreateGlobalStringPtr("[ERROR] Comparison outside SELECT context.\n");
              irBuilder->CreateCall(printfFunc, {msg});
              return ConstantInt::get(Type::getInt1Ty(context), 0);
         }
 
-        // 1. Identificar la columna (Lado Izquierdo)
         std::string colName = ctx->ID()->getText();
         Value* lhsVal = nullptr;
         DataType lhsType;
         
         for(size_t i=0; i < activeTableInfo->columns.size(); ++i) {
             if (activeTableInfo->columns[i].name == colName) {
-                // Cargar el valor desde el buffer de lectura actual
                 lhsType = activeTableInfo->columns[i].type;
                 lhsVal = irBuilder->CreateLoad(getLLVMType(lhsType), activeReadBuffers[i], "lhs_load");
                 break;
@@ -155,21 +150,15 @@ private:
              return ConstantInt::get(Type::getInt1Ty(context), 0);
         }
 
-        // 2. Obtener el literal (Lado Derecho)
         Value* rhsVal = compileDato(ctx->dato());
         
-        // 3. Obtener el operador
         std::string op = "";
         if (ctx->COMP_OP()) op = ctx->COMP_OP()->getText();
         else if (ctx->EQUAL()) op = ctx->EQUAL()->getText();
 
-        // 4. Generar instrucción de comparación según tipos
-        // CASO: ENTEROS (INT o BOOLEAN)
         if (lhsType == INT_T || lhsType == BOOLEAN_T) {
-            // Si comparamos Int con Decimal, castear Int a Double
             if (rhsVal->getType()->isDoubleTy()) {
                 lhsVal = irBuilder->CreateSIToFP(lhsVal, Type::getDoubleTy(context), "cast_i2d");
-                // Comparación flotante
                 if (op == ">") return irBuilder->CreateFCmpOGT(lhsVal, rhsVal, "cmp_gt");
                 if (op == "<") return irBuilder->CreateFCmpOLT(lhsVal, rhsVal, "cmp_lt");
                 if (op == ">=") return irBuilder->CreateFCmpOGE(lhsVal, rhsVal, "cmp_ge");
@@ -177,7 +166,6 @@ private:
                 if (op == "=") return irBuilder->CreateFCmpOEQ(lhsVal, rhsVal, "cmp_eq");
                 if (op == "!=") return irBuilder->CreateFCmpONE(lhsVal, rhsVal, "cmp_ne");
             } else {
-                // Comparación entera normal
                 if (op == ">") return irBuilder->CreateICmpSGT(lhsVal, rhsVal, "cmp_gt");
                 if (op == "<") return irBuilder->CreateICmpSLT(lhsVal, rhsVal, "cmp_lt");
                 if (op == ">=") return irBuilder->CreateICmpSGE(lhsVal, rhsVal, "cmp_ge");
@@ -186,13 +174,10 @@ private:
                 if (op == "!=") return irBuilder->CreateICmpNE(lhsVal, rhsVal, "cmp_ne");
             }
         }
-        // CASO: DECIMALES
         else if (lhsType == DECIMAL_T) {
-            // Si el literal es entero, castear a double
             if (rhsVal->getType()->isIntegerTy()) {
                 rhsVal = irBuilder->CreateSIToFP(rhsVal, Type::getDoubleTy(context), "cast_lit_i2d");
             }
-            
             if (op == ">") return irBuilder->CreateFCmpOGT(lhsVal, rhsVal, "cmp_gt");
             if (op == "<") return irBuilder->CreateFCmpOLT(lhsVal, rhsVal, "cmp_lt");
             if (op == ">=") return irBuilder->CreateFCmpOGE(lhsVal, rhsVal, "cmp_ge");
@@ -201,8 +186,31 @@ private:
             if (op == "!=") return irBuilder->CreateFCmpONE(lhsVal, rhsVal, "cmp_ne");
         }
 
-        // Placeholder para String u otros no soportados
         return ConstantInt::get(Type::getInt1Ty(context), 0); 
+    }
+
+    // --- NUEVO: Función para eliminar tabla del esquema ---
+    void removeFromSchema(const std::string& targetTable) {
+        std::ifstream inFile("schema.txt");
+        std::vector<std::string> lines;
+        std::string line;
+        
+        while (std::getline(inFile, line)) {
+            if (line.empty()) continue;
+            std::stringstream ss(line);
+            std::string currentTable;
+            ss >> currentTable;
+            if (currentTable != targetTable) {
+                lines.push_back(line);
+            }
+        }
+        inFile.close();
+
+        std::ofstream outFile("schema.txt", std::ios::trunc);
+        for (const auto& l : lines) {
+            outFile << l << "\n";
+        }
+        outFile.close();
     }
 
     void saveSchema(const std::string& tableName, const std::vector<ColumnInfo>& cols) {
@@ -311,7 +319,6 @@ public:
         }
         TableInfo& info = symbolTable[tableName];
         
-        // Safety Check
         auto values = ctx->dato();
         if (values.size() != info.columns.size()) {
              std::cerr << "Insert Error: Column mismatch." << std::endl;
@@ -465,7 +472,6 @@ public:
             DataType dt = item.info.type;
             
             if (idx == -1 && item.funcCtx != nullptr) {
-                // Ahora visitFunctionCall tendrá acceso a 'activeReadBuffers'
                 std::any resultAny = visitFunctionCall(item.funcCtx);
                 Value* resultVal = std::any_cast<Value*>(resultAny);
                 irBuilder->CreateCall(printfFunc, {irBuilder->CreateGlobalStringPtr(" %-20s |"), resultVal});
@@ -529,7 +535,33 @@ public:
         return (Value*)phi;
     }
 
-    virtual std::any visitDrop(SQLMiniParser::DropContext *ctx) { return std::any(); }
+    // --- IMPLEMENTACIÓN DROP ---
+    virtual std::any visitDrop(SQLMiniParser::DropContext *ctx) override {
+        std::string tableName = ctx->ID()->getText();
+
+        // 1. Validar existencia en SymbolTable
+        if (symbolTable.find(tableName) == symbolTable.end()) {
+            Value* msg = irBuilder->CreateGlobalStringPtr("Error: Table " + tableName + " does not exist.\n");
+            irBuilder->CreateCall(printfFunc, {msg});
+            return std::any();
+        }
+
+        // 2. Eliminar de Memoria (SymbolTable)
+        symbolTable.erase(tableName);
+
+        // 3. Eliminar de Disco (Schema y Data)
+        // Se ejecuta en tiempo de compilación del driver, lo cual es consistente con visitCreate.
+        removeFromSchema(tableName);
+        
+        std::string filename = tableName + ".txt";
+        std::remove(filename.c_str()); // <cstdio>
+
+        // 4. Generar código IR para notificar al usuario (Runtime)
+        Value* msg = irBuilder->CreateGlobalStringPtr("Table '" + tableName + "' dropped.\n");
+        irBuilder->CreateCall(printfFunc, {msg});
+
+        return std::any();
+    }
 
     virtual std::any visitForLoop(SQLMiniParser::ForLoopContext *ctx) override {
         std::string varName = ctx->ID()->getText();

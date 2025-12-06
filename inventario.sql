@@ -1,29 +1,19 @@
--- 1. Tabla de Hardware
-create table hardware (
-    int serial,
-    varchar(100) modelo,
-    decimal(10,2) precio,
-    boolean disponible
+CREATE TABLE hardware (
+    id_producto int,          -- Antes tenías: int id_producto
+    modelo varchar(50),       -- Antes: varchar(50) modelo
+    precio decimal(10,2),     -- Antes: decimal(10,2) precio
+    en_stock boolean          -- Antes: boolean en_stock
 );
 
--- 2. Inserts masivos
-insert into hardware values (5001, 'Monitor_LG_24', 150.99, true);
-insert into hardware values (5002, 'Teclado_Mecanico', 89.50, true);
-insert into hardware values (5003, 'Mouse_Logitech', 25.00, false);
-insert into hardware values (5004, 'Cable_HDMI_2m', 5.99, true);
-insert into hardware values (5005, 'Webcam_HD', 45.00, true);
+INSERT INTO hardware VALUES (1, 'Monitor_4K', 299.99, true);
+INSERT INTO hardware VALUES (2, 'Teclado_Mec', 89.50, true);
+INSERT INTO hardware VALUES (3, 'Mouse_Gamer', 45.00, false);
 
--- 3. Tabla de Ventas (Sin FK, solo ids logicos)
-create table ventas (
-    int id_venta,
-    int id_producto,
-    int cantidad,
-    decimal(10,2) total
+CREATE TABLE ventas (
+    id_venta int
 );
 
-insert into ventas values (1, 5001, 2, 301.98);
-insert into ventas values (2, 5004, 10, 59.90);
+INSERT INTO ventas VALUES (1001);
 
--- 4. Probar proyección (solo algunas columnas)
-select modelo, precio from hardware;
-select * from ventas;
+SELECT * FROM hardware;
+SELECT * FROM ventas;
