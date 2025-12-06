@@ -7,79 +7,110 @@ query
     : create  
     | insert
     | select
-    | drop; // 1. AÑADIDO: Incluir la nueva sentencia DROP
+    | drop
+    | forLoop; 
     
-drop: DROP TABLE ID PYC; // 2. AÑADIDO: Regla para eliminar tablas
+drop: DROP TABLE ID PYC;
 
 create: CREATE TABLE ID IPARE 
-    columnDefinition (COM columnDefinition)* (COM tableConstraint)* // Permitir definición de columnas y luego constraints
-    DPARE PYC; 
+    columnDefinition (COM columnDefinition)* (COM tableConstraint)* DPARE PYC;
 
-// Regla para la definición simple de columnas (tipo y nombre)
-columnDefinition: tipoDato ID; 
+// FIX: Cambiado el orden a 'ID tipoDato' (Standard SQL) para soportar "id int"
+columnDefinition: ID tipoDato; 
 
 tableConstraint
-    : (CONSTRAINT ID)? FOREIGN KEY IPARE ID DPARE REFERENCES ID IPARE ID DPARE // Opción 1: FK
-    | PRIMARY KEY IPARE ID (COM ID)* DPARE; // Opción 2: PK (Soportando columnas múltiples, aunque simplificaremos la validación)
+    : (CONSTRAINT ID)? FOREIGN KEY IPARE ID DPARE REFERENCES ID IPARE ID DPARE 
+    | PRIMARY KEY IPARE ID (COM ID)* DPARE; 
 
 insert: INSERT INTO ID VALUES  
-IPARE dato (COM dato)* DPARE
-(COM IPARE dato (COM dato)* DPARE)*
-PYC;
+    IPARE dato (COM dato)* DPARE
+    (COM IPARE dato (COM dato)* DPARE)*
+    PYC;
 
 select: SELECT (ESTRELLA |  
-ID (COM ID)* ) FROM ID PYC;
+    expr (COM expr)* ) FROM ID PYC;
+
+forLoop
+    : FOR ID EQUAL VINT TO VINT DO
+      insert 
+      END FOR PYC;
+
+expr
+    : ID                      
+    | functionCall;           
+
+functionCall
+    : IF_FUNC IPARE comparison COM dato COM dato DPARE (AS ID)?; 
+
+comparison
+    : ID (COMP_OP | EQUAL) dato; 
 
 tipoDato
-    : INT
-    | DECIMAL IPARE VINT COM VINT DPARE
-    | VARCHAR IPARE VINT DPARE
-    | BOOLEAN;
+    : INT_TYPE
+    | DECIMAL_TYPE IPARE VINT COM VINT DPARE
+    | VARCHAR_TYPE IPARE VINT DPARE
+    | BOOLEAN_TYPE;
 
 dato
     : VINT
     | STRING
     | VINT PTO VINT
-    | bool ;
+    | bool ; 
     
 bool
-    : TRUE
-    | FALSE;
+    : TRUE_VAL
+    | FALSE_VAL;
 
-// === LEXER RULES ===
+// === LEXER RULES (CASE INSENSITIVE) ===
 
-CREATE : 'create';
-TABLE : 'table';
-INSERT : 'insert';
-INTO : 'into';
-SELECT : 'select';
-VALUES : 'values';
-ESTRELLA : '*';
-FROM : 'from';
+CREATE:     [Cc][Rr][Ee][Aa][Tt][Ee];
+TABLE:      [Tt][Aa][Bb][Ll][Ee];
+DROP:       [Dd][Rr][Oo][Pp];
+CONSTRAINT: [Cc][Oo][Nn][Ss][Tt][Rr][Aa][Ii][Nn][Tt];
+PRIMARY:    [Pp][Rr][Ii][Mm][Aa][Rr][Yy];
+KEY:        [Kk][Ee][Yy];
+FOREIGN:    [Ff][Oo][Rr][Ee][Ii][Gg][Nn];
+REFERENCES: [Rr][Ee][Ff][Ee][Rr][Ee][Nn][Cc][Ee][Ss];
 
-// 4. AÑADIDO: Nuevos Tokens del Lexer
-DROP: 'drop';
-FOREIGN: 'foreign';
-PRIMARY: 'primary'; 
-KEY: 'key';
-REFERENCES: 'references';
-CONSTRAINT: 'constraint';
+INSERT:     [Ii][Nn][Ss][Ee][Rr][Tt];
+INTO:       [Ii][Nn][Tt][Oo];
+VALUES:     [Vv][Aa][Ll][Uu][Ee][Ss];
+SELECT:     [Ss][Ee][Ll][Ee][Cc][Tt];
+FROM:       [Ff][Rr][Oo][Mm];
+WHERE:      [Ww][Hh][Ee][Rr][Ee]; 
 
-INT : 'int';
-VINT : [0-9]+;
-DECIMAL : 'decimal';
-VARCHAR : 'varchar';
-BOOLEAN : 'boolean';
-TRUE : 'true';
-FALSE : 'false';
+INT_TYPE:     [Ii][Nn][Tt];
+DECIMAL_TYPE: [Dd][Ee][Cc][Ii][Mm][Aa][Ll];
+VARCHAR_TYPE: [Vv][Aa][Rr][Cc][Hh][Aa][Rr];
+BOOLEAN_TYPE: [Bb][Oo][Oo][Ll][Ee][Aa][Nn];
 
-DPARE : ')';
-IPARE : '(';
-PYC : ';';
-COM : ',';
-PTO : '.';
-ID : [a-zA-Z_][a-zA-Z_0-9]* ; 
-STRING : '\'' ( ~'\'' )* '\'';
+TRUE_VAL:   [Tt][Rr][Uu][Ee];
+FALSE_VAL:  [Ff][Aa][Ll][Ss][Ee];
+
+FOR:        [Ff][Oo][Rr];
+TO:         [Tt][Oo];
+DO:         [Dd][Oo];
+END:        [Ee][Nn][Dd];
+IF_FUNC:    [Ii][Ff]; 
+AS:         [Aa][Ss];
+
+EQUAL:      '='; 
+COMP_OP:    '>' | '<' | '>=' | '<=' | '!=';
+
+PLUS:       '+';
+MINUS:      '-';
+ESTRELLA:   '*'; 
+DIV:        '/';
+
+DPARE:      ')';
+IPARE:      '(';
+PYC:        ';';
+COM:        ',';
+PTO:        '.';
+
+ID:         [a-zA-Z_][a-zA-Z_0-9]*;
+VINT:       [0-9]+;
+STRING:     '\'' ( ~'\'' )* '\'';
 
 LINE_COMMENT: '--' ~[\r\n]* -> skip; 
-WS : [ \t\r\n]+ -> skip;
+WS:           [ \t\r\n]+ -> skip;

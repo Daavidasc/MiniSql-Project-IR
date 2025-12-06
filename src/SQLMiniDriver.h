@@ -11,24 +11,31 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/Support/raw_ostream.h"
 #include "SQLMiniBaseVisitor.h" 
+#include "SQLMiniParser.h" 
 
 #include <map>
 #include <vector>
 #include <string>
 #include <iostream>
-#include <fstream> // Necesario para guardar el esquema
-#include <sstream> // Necesario para leer el esquema
+#include <fstream> 
+#include <sstream> 
+#include <algorithm> 
 
 using namespace antlr4;
 using namespace llvm;
 using namespace std;
 
-// --- Estructuras para Metadata ---
 enum DataType { INT_T, DECIMAL_T, VARCHAR_T, BOOLEAN_T };
 
 struct ColumnInfo {
     std::string name;
     DataType type;
+};
+
+struct QueryColumn {
+    int index; 
+    ColumnInfo info;
+    SQLMiniParser::FunctionCallContext* funcCtx; 
 };
 
 struct TableInfo {
@@ -39,13 +46,28 @@ struct TableInfo {
 class SQLMiniDriver : public SQLMiniBaseVisitor {
 private:
     std::map<std::string, TableInfo> symbolTable; 
+    
+    // --- VARIABLES DE CONTEXTO (NUEVO) ---
+    // Estas variables permiten a compileComparison acceder a los datos de la fila actual
+    std::vector<Value*> activeReadBuffers;
+    TableInfo* activeTableInfo = nullptr;
 
-    // Helpers de Tipos
+    // Helper case-insensitive
+    bool iequals(const string& a, const string& b) {
+        if (a.size() != b.size()) return false;
+        for (size_t i = 0; i < a.size(); ++i)
+            if (tolower(a[i]) != tolower(b[i])) return false;
+        return true;
+    }
+
     DataType getDataTypeFromText(const std::string& typeText) {
-        if (typeText.find("int") != std::string::npos) return INT_T;
-        if (typeText.find("decimal") != std::string::npos) return DECIMAL_T;
-        if (typeText.find("varchar") != std::string::npos) return VARCHAR_T;
-        if (typeText.find("boolean") != std::string::npos) return BOOLEAN_T;
+        string lowerText = typeText;
+        transform(lowerText.begin(), lowerText.end(), lowerText.begin(), ::tolower);
+        
+        if (lowerText.find("int") != std::string::npos) return INT_T;
+        if (lowerText.find("decimal") != std::string::npos) return DECIMAL_T;
+        if (lowerText.find("varchar") != std::string::npos) return VARCHAR_T;
+        if (lowerText.find("boolean") != std::string::npos) return BOOLEAN_T;
         throw std::runtime_error("Unknown type: " + typeText);
     }
 
@@ -53,7 +75,7 @@ private:
         switch (dt) {
             case INT_T: return Type::getInt32Ty(context);
             case DECIMAL_T: return Type::getDoubleTy(context);
-            case BOOLEAN_T: return Type::getInt1Ty(context);
+            case BOOLEAN_T: return Type::getInt32Ty(context); // i32 para evitar corrupción
             case VARCHAR_T: return PointerType::get(context, 0); 
         }
         return Type::getVoidTy(context);
@@ -73,7 +95,7 @@ private:
         switch (dt) {
             case INT_T: return "%d";
             case DECIMAL_T: return "%lf";
-            case VARCHAR_T: return "%s"; // %s lee hasta espacio. Usar %[^\t] si soportas espacios.
+            case VARCHAR_T: return "%s";
             case BOOLEAN_T: return "%d";
         }
         return "";
@@ -82,15 +104,109 @@ private:
     std::string getSeparatorLine(int colCount) {
         std::string line = "+";
         for (int i = 0; i < colCount; ++i) {
-            line += std::string(22, '-') + "+"; // 22 guiones por columna
+            line += std::string(22, '-') + "+"; 
         }
         line += "\n";
         return line;
     }
 
-    // --- NUEVO: Guardar esquema en disco ---
+    Value* compileDato(SQLMiniParser::DatoContext *ctx) {
+        std::string valText = ctx->getText();
+
+        if (ctx->VINT().size() == 1 && ctx->PTO() == nullptr) { 
+            return ConstantInt::get(Type::getInt32Ty(context), std::stoi(valText));
+        } else if (ctx->VINT().size() == 2 && ctx->PTO() != nullptr) {
+            return ConstantFP::get(Type::getDoubleTy(context), std::stod(valText));
+        } else if (ctx->STRING() != nullptr) {
+            std::string content = valText.substr(1, valText.size()-2); 
+            return irBuilder->CreateGlobalStringPtr(content);
+        } else if (ctx->bool_() != nullptr) { 
+            bool isTrue = iequals(valText, "true");
+            return ConstantInt::get(Type::getInt32Ty(context), isTrue);
+        }
+        throw std::runtime_error("Unsupported dato type: " + valText);
+    }
+    
+    // --- LÓGICA REAL DE COMPARACIÓN (ACTUALIZADO) ---
+    Value* compileComparison(SQLMiniParser::ComparisonContext *ctx) {
+        // Verificar que tenemos contexto de lectura
+        if (!activeTableInfo || activeReadBuffers.empty()) {
+             Value* msg = irBuilder->CreateGlobalStringPtr("[ERROR] Comparison outside SELECT context.\n");
+             irBuilder->CreateCall(printfFunc, {msg});
+             return ConstantInt::get(Type::getInt1Ty(context), 0);
+        }
+
+        // 1. Identificar la columna (Lado Izquierdo)
+        std::string colName = ctx->ID()->getText();
+        Value* lhsVal = nullptr;
+        DataType lhsType;
+        
+        for(size_t i=0; i < activeTableInfo->columns.size(); ++i) {
+            if (activeTableInfo->columns[i].name == colName) {
+                // Cargar el valor desde el buffer de lectura actual
+                lhsType = activeTableInfo->columns[i].type;
+                lhsVal = irBuilder->CreateLoad(getLLVMType(lhsType), activeReadBuffers[i], "lhs_load");
+                break;
+            }
+        }
+
+        if (!lhsVal) {
+             std::cerr << "Error: Column " << colName << " not found for comparison." << std::endl;
+             return ConstantInt::get(Type::getInt1Ty(context), 0);
+        }
+
+        // 2. Obtener el literal (Lado Derecho)
+        Value* rhsVal = compileDato(ctx->dato());
+        
+        // 3. Obtener el operador
+        std::string op = "";
+        if (ctx->COMP_OP()) op = ctx->COMP_OP()->getText();
+        else if (ctx->EQUAL()) op = ctx->EQUAL()->getText();
+
+        // 4. Generar instrucción de comparación según tipos
+        // CASO: ENTEROS (INT o BOOLEAN)
+        if (lhsType == INT_T || lhsType == BOOLEAN_T) {
+            // Si comparamos Int con Decimal, castear Int a Double
+            if (rhsVal->getType()->isDoubleTy()) {
+                lhsVal = irBuilder->CreateSIToFP(lhsVal, Type::getDoubleTy(context), "cast_i2d");
+                // Comparación flotante
+                if (op == ">") return irBuilder->CreateFCmpOGT(lhsVal, rhsVal, "cmp_gt");
+                if (op == "<") return irBuilder->CreateFCmpOLT(lhsVal, rhsVal, "cmp_lt");
+                if (op == ">=") return irBuilder->CreateFCmpOGE(lhsVal, rhsVal, "cmp_ge");
+                if (op == "<=") return irBuilder->CreateFCmpOLE(lhsVal, rhsVal, "cmp_le");
+                if (op == "=") return irBuilder->CreateFCmpOEQ(lhsVal, rhsVal, "cmp_eq");
+                if (op == "!=") return irBuilder->CreateFCmpONE(lhsVal, rhsVal, "cmp_ne");
+            } else {
+                // Comparación entera normal
+                if (op == ">") return irBuilder->CreateICmpSGT(lhsVal, rhsVal, "cmp_gt");
+                if (op == "<") return irBuilder->CreateICmpSLT(lhsVal, rhsVal, "cmp_lt");
+                if (op == ">=") return irBuilder->CreateICmpSGE(lhsVal, rhsVal, "cmp_ge");
+                if (op == "<=") return irBuilder->CreateICmpSLE(lhsVal, rhsVal, "cmp_le");
+                if (op == "=") return irBuilder->CreateICmpEQ(lhsVal, rhsVal, "cmp_eq");
+                if (op == "!=") return irBuilder->CreateICmpNE(lhsVal, rhsVal, "cmp_ne");
+            }
+        }
+        // CASO: DECIMALES
+        else if (lhsType == DECIMAL_T) {
+            // Si el literal es entero, castear a double
+            if (rhsVal->getType()->isIntegerTy()) {
+                rhsVal = irBuilder->CreateSIToFP(rhsVal, Type::getDoubleTy(context), "cast_lit_i2d");
+            }
+            
+            if (op == ">") return irBuilder->CreateFCmpOGT(lhsVal, rhsVal, "cmp_gt");
+            if (op == "<") return irBuilder->CreateFCmpOLT(lhsVal, rhsVal, "cmp_lt");
+            if (op == ">=") return irBuilder->CreateFCmpOGE(lhsVal, rhsVal, "cmp_ge");
+            if (op == "<=") return irBuilder->CreateFCmpOLE(lhsVal, rhsVal, "cmp_le");
+            if (op == "=") return irBuilder->CreateFCmpOEQ(lhsVal, rhsVal, "cmp_eq");
+            if (op == "!=") return irBuilder->CreateFCmpONE(lhsVal, rhsVal, "cmp_ne");
+        }
+
+        // Placeholder para String u otros no soportados
+        return ConstantInt::get(Type::getInt1Ty(context), 0); 
+    }
+
     void saveSchema(const std::string& tableName, const std::vector<ColumnInfo>& cols) {
-        std::ofstream schemaFile("schema.txt", std::ios::app); // Append
+        std::ofstream schemaFile("schema.txt", std::ios::app);
         if (schemaFile.is_open()) {
             schemaFile << tableName;
             for (const auto& col : cols) {
@@ -101,7 +217,6 @@ private:
         }
     }
 
-    // --- NUEVO: Cargar esquema al iniciar ---
     void loadSchema() {
         std::ifstream schemaFile("schema.txt");
         std::string line;
@@ -110,26 +225,21 @@ private:
             std::stringstream ss(line);
             std::string tableName, colToken;
             ss >> tableName;
-
-            if (symbolTable.count(tableName)) continue; // Ya cargada
+            if (symbolTable.count(tableName)) continue; 
 
             std::vector<ColumnInfo> cols;
             std::vector<Type*> structFields;
-            
             while (ss >> colToken) {
                 size_t sep = colToken.find(':');
                 std::string name = colToken.substr(0, sep);
                 int typeInt = std::stoi(colToken.substr(sep + 1));
                 DataType dt = (DataType)typeInt;
-                
                 cols.push_back({name, dt});
                 structFields.push_back(getLLVMType(dt));
             }
-
             StructType* tableStruct = StructType::create(context, "struct." + tableName);
             tableStruct->setBody(structFields);
             symbolTable[tableName] = {tableStruct, cols};
-            // std::cout << "Loaded schema for: " << tableName << std::endl;
         }
     }
 
@@ -144,7 +254,6 @@ public:
     SQLMiniDriver()
       : module(std::make_unique<Module>("MiniSQL_IR", context)),
         irBuilder(std::make_unique<IRBuilder<>>(context)) {
-            // CARGA AUTOMÁTICA AL INICIAR
             loadSchema();
         }
 
@@ -165,59 +274,49 @@ public:
         visitChildren(ctx);
 
         irBuilder->CreateRet(ConstantInt::get(Type::getInt32Ty(context), 0));
-        outs() << *module;
         return std::any();
     }
 
     virtual std::any visitCreate(SQLMiniParser::CreateContext *ctx) {
         std::string tableName = ctx->ID()->getText();
-        
-        // Evitar duplicados si ya existe
         if (symbolTable.count(tableName)) {
             Value* msg = irBuilder->CreateGlobalStringPtr("Table " + tableName + " already exists.\n");
             irBuilder->CreateCall(printfFunc, {msg});
             return std::any();
         }
-
         std::vector<Type*> structFields;
         std::vector<ColumnInfo> cols;
-
         StructType* tableStruct = StructType::create(context, "struct." + tableName);
         
-        // Nota: Asumimos gramática corregida: ID tipoDato, O usas tipoDato ID según tu preferencia.
-        // Aquí uso tu lógica original (tipo nombre o nombre tipo según hayas definido)
-        // Adaptado a la gramática fija: columnDefinition: ID tipoDato
         for (auto const& colDef : ctx->columnDefinition()) {
-             // Si usas gramática "ID tipoDato":
              std::string name = colDef->ID()->getText();
              std::string typeText = colDef->tipoDato()->getText();
-             
-             // Si usas gramática "tipoDato ID", invierte las líneas de arriba.
-             
             DataType dt = getDataTypeFromText(typeText);
             structFields.push_back(getLLVMType(dt));
             cols.push_back({name, dt});
         }
         tableStruct->setBody(structFields);
-
         symbolTable[tableName] = {tableStruct, cols};
-        
-        // GUARDAR EN DISCO EL ESQUEMA
         saveSchema(tableName, cols);
-
         Value* msg = irBuilder->CreateGlobalStringPtr("Table '" + tableName + "' created.\n");
         irBuilder->CreateCall(printfFunc, {msg});
-
         return std::any();
     }
 
     virtual std::any visitInsert(SQLMiniParser::InsertContext *ctx) {
         std::string tableName = ctx->ID()->getText();
         if (symbolTable.find(tableName) == symbolTable.end()) {
-            std::cerr << "Error: Table " << tableName << " not found (Load schema failed?)." << std::endl;
+            std::cerr << "Error: Table " << tableName << " not found." << std::endl;
             return std::any();
         }
         TableInfo& info = symbolTable[tableName];
+        
+        // Safety Check
+        auto values = ctx->dato();
+        if (values.size() != info.columns.size()) {
+             std::cerr << "Insert Error: Column mismatch." << std::endl;
+             return std::any();
+        }
 
         Value* filename = irBuilder->CreateGlobalStringPtr(tableName + ".txt");
         Value* mode = irBuilder->CreateGlobalStringPtr("a"); 
@@ -227,18 +326,19 @@ public:
         std::vector<Value*> args;
         args.push_back(filePtr); 
 
-        auto values = ctx->dato();
         for (size_t i = 0; i < values.size(); ++i) {
             std::string valText = values[i]->getText();
             DataType dt = info.columns[i].type;
-            
             if (i > 0) fileFormatStr += "\t";
             fileFormatStr += getPrintFormat(dt);
 
             Value* valToStore = nullptr;
             if (dt == INT_T) valToStore = ConstantInt::get(Type::getInt32Ty(context), std::stoi(valText));
             else if (dt == DECIMAL_T) valToStore = ConstantFP::get(Type::getDoubleTy(context), std::stod(valText));
-            else if (dt == BOOLEAN_T) valToStore = ConstantInt::get(Type::getInt1Ty(context), valText == "true");
+            else if (dt == BOOLEAN_T) {
+                bool isTrue = iequals(valText, "true");
+                valToStore = ConstantInt::get(Type::getInt32Ty(context), isTrue);
+            }
             else if (dt == VARCHAR_T) {
                 std::string content = valText.substr(1, valText.size()-2); 
                 valToStore = irBuilder->CreateGlobalStringPtr(content);
@@ -250,59 +350,59 @@ public:
         irBuilder->CreateCall(fprintfFunc, args);
         irBuilder->CreateCall(fcloseFunc, {filePtr});
         irBuilder->CreateCall(printfFunc, {irBuilder->CreateGlobalStringPtr("Row saved to " + tableName + ".txt\n")});
-
         return std::any();
     }
 
     virtual std::any visitSelect(SQLMiniParser::SelectContext *ctx) {
-        std::string tableName = ctx->ID(ctx->ID().size() - 1)->getText();
-        
+        std::string tableName = ctx->ID()->getText();
         if (symbolTable.find(tableName) == symbolTable.end()) {
-            Value* errMsg = irBuilder->CreateGlobalStringPtr("Error: Table " + tableName + " not found in schema.\n");
+            Value* errMsg = irBuilder->CreateGlobalStringPtr("Error: Table " + tableName + " not found.\n");
             irBuilder->CreateCall(printfFunc, {errMsg});
             return std::any();
         }
         
         TableInfo& info = symbolTable[tableName];
+        std::vector<QueryColumn> selectedCols;
 
-        // 1. Filtrar columnas seleccionadas
-        std::vector<std::pair<int, ColumnInfo>> selectedCols;
         if (ctx->ESTRELLA()) {
-            for (size_t i = 0; i < info.columns.size(); ++i) selectedCols.push_back({i, info.columns[i]});
+            for (size_t i = 0; i < info.columns.size(); ++i) 
+                selectedCols.push_back({(int)i, info.columns[i], nullptr});
         } else {
-             for (size_t i = 0; i < ctx->ID().size() - 1; ++i) {
-                std::string colName = ctx->ID(i)->getText();
-                for(size_t j=0; j<info.columns.size(); ++j) {
-                    if(info.columns[j].name == colName) selectedCols.push_back({j, info.columns[j]});
+            auto selectedExpressions = ctx->expr();
+            for (auto const& exprCtx : selectedExpressions) {
+                if (exprCtx->ID() != nullptr) { 
+                    std::string colName = exprCtx->ID()->getText();
+                    for(size_t j=0; j<info.columns.size(); ++j) {
+                        if(info.columns[j].name == colName) {
+                            selectedCols.push_back({(int)j, info.columns[j], nullptr});
+                            break;
+                        }
+                    }
+                } else if (exprCtx->functionCall() != nullptr) { 
+                    ColumnInfo calculatedCol = {"Calculated_IF", VARCHAR_T};
+                    if (exprCtx->functionCall()->ID() != nullptr) {
+                        calculatedCol.name = exprCtx->functionCall()->ID()->getText();
+                    }
+                    selectedCols.push_back({-1, calculatedCol, exprCtx->functionCall()}); 
                 }
-             }
+            }
         }
 
-        // --- GENERAR CABECERA TIPO TABLA ---
         std::string separator = getSeparatorLine(selectedCols.size());
-        
         irBuilder->CreateCall(printfFunc, {irBuilder->CreateGlobalStringPtr("\nQuery result for: " + tableName + "\n")});
-        
-        // Linea superior (+----------------+)
         irBuilder->CreateCall(printfFunc, {irBuilder->CreateGlobalStringPtr(separator)});
 
-        // Nombres de columnas con padding fijo
         std::string headerStr = "|";
         for (const auto& item : selectedCols) {
-            // Truco: formateamos el string en C++ para que tenga espacios de relleno
-            std::string name = item.second.name;
-            if (name.length() > 20) name = name.substr(0, 20); // Cortar si es muy largo
-            else name.append(20 - name.length(), ' '); // Rellenar con espacios
-            
+            std::string name = item.info.name;
+            if (name.length() > 20) name = name.substr(0, 20); 
+            else name.append(20 - name.length(), ' '); 
             headerStr += " " + name + " |"; 
         }
         headerStr += "\n";
         irBuilder->CreateCall(printfFunc, {irBuilder->CreateGlobalStringPtr(headerStr)});
-
-        // Linea media (+----------------+)
         irBuilder->CreateCall(printfFunc, {irBuilder->CreateGlobalStringPtr(separator)});
 
-        // --- PREPARAR LECTURA DE ARCHIVO ---
         Value* filename = irBuilder->CreateGlobalStringPtr(tableName + ".txt");
         Value* mode = irBuilder->CreateGlobalStringPtr("r");
         Value* filePtr = irBuilder->CreateCall(fopenFunc, {filename, mode});
@@ -314,18 +414,15 @@ public:
         Value* isNull = irBuilder->CreateICmpEQ(filePtr, Constant::getNullValue(filePtr->getType()));
         irBuilder->CreateCondBr(isNull, fileErrBB, fileOkBB);
 
-        // Caso Error: Archivo no existe
         irBuilder->SetInsertPoint(fileErrBB);
         irBuilder->CreateCall(printfFunc, {irBuilder->CreateGlobalStringPtr("| No data found (Empty table)                  |\n")});
         irBuilder->CreateCall(printfFunc, {irBuilder->CreateGlobalStringPtr(separator)});
         irBuilder->CreateBr(afterSelectBB);
 
-        // Caso OK: Leer datos
         irBuilder->SetInsertPoint(fileOkBB);
         std::vector<Value*> readBuffers;
         std::string scanFmt = "";
 
-        // Preparar buffers para fscanf (igual que antes)
         for (size_t i = 0; i < info.columns.size(); ++i) {
             DataType dt = info.columns[i].type;
             if (i > 0) scanFmt += "\t"; 
@@ -346,7 +443,6 @@ public:
         irBuilder->CreateBr(loopCond);
         irBuilder->SetInsertPoint(loopCond);
 
-        // Ejecutar fscanf
         std::vector<Value*> scanArgs;
         scanArgs.push_back(filePtr);
         scanArgs.push_back(irBuilder->CreateGlobalStringPtr(scanFmt));
@@ -357,138 +453,117 @@ public:
         Value* isSuccess = irBuilder->CreateICmpEQ(scanResult, expectedCols);
         irBuilder->CreateCondBr(isSuccess, loopBody, loopEnd);
 
-        // --- IMPRIMIR FILA CON FORMATO FIJO ---
         irBuilder->SetInsertPoint(loopBody);
-        
-        irBuilder->CreateCall(printfFunc, {irBuilder->CreateGlobalStringPtr("|")}); // Inicio de linea
+        irBuilder->CreateCall(printfFunc, {irBuilder->CreateGlobalStringPtr("|")}); 
+
+        // --- CONTEXTO ACTIVO: Aquí pasamos los buffers a compileComparison ---
+        this->activeReadBuffers = readBuffers;
+        this->activeTableInfo = &info;
 
         for (const auto& item : selectedCols) {
-            int idx = item.first;
-            DataType dt = item.second.type;
-            Value* rawVal = readBuffers[idx]; 
-
-            // AQUÍ ESTÁ LA MAGIA: %-20s (20 espacios, alineado a la izquierda)
-            if (dt == VARCHAR_T) {
-                irBuilder->CreateCall(printfFunc, {irBuilder->CreateGlobalStringPtr(" %-20s |"), rawVal});
+            int idx = item.index;
+            DataType dt = item.info.type;
+            
+            if (idx == -1 && item.funcCtx != nullptr) {
+                // Ahora visitFunctionCall tendrá acceso a 'activeReadBuffers'
+                std::any resultAny = visitFunctionCall(item.funcCtx);
+                Value* resultVal = std::any_cast<Value*>(resultAny);
+                irBuilder->CreateCall(printfFunc, {irBuilder->CreateGlobalStringPtr(" %-20s |"), resultVal});
             } else {
-                Value* valLoaded = irBuilder->CreateLoad(getLLVMType(dt), rawVal);
-                std::string outFmt = "";
-                // Usamos padding fijo de 20 chars
-                if (dt == INT_T || dt == BOOLEAN_T) outFmt = " %-20d |";
-                else if (dt == DECIMAL_T) outFmt = " %-20.2f |";
-                
-                irBuilder->CreateCall(printfFunc, {irBuilder->CreateGlobalStringPtr(outFmt), valLoaded});
+                Value* rawVal = readBuffers[idx]; 
+                if (dt == VARCHAR_T) {
+                    irBuilder->CreateCall(printfFunc, {irBuilder->CreateGlobalStringPtr(" %-20s |"), rawVal});
+                } else {
+                    Value* valLoaded = irBuilder->CreateLoad(getLLVMType(dt), rawVal);
+                    std::string outFmt = "";
+                    if (dt == INT_T || dt == BOOLEAN_T) outFmt = " %-20d |";
+                    else if (dt == DECIMAL_T) outFmt = " %-20.2f |";
+                    irBuilder->CreateCall(printfFunc, {irBuilder->CreateGlobalStringPtr(outFmt), valLoaded});
+                }
             }
         }
-        irBuilder->CreateCall(printfFunc, {irBuilder->CreateGlobalStringPtr("\n")}); // Fin de linea
+        
+        // --- LIMPIEZA DE CONTEXTO ---
+        this->activeReadBuffers.clear();
+        this->activeTableInfo = nullptr;
+
+        irBuilder->CreateCall(printfFunc, {irBuilder->CreateGlobalStringPtr("\n")}); 
         irBuilder->CreateBr(loopCond); 
 
-        // Fin del loop
         irBuilder->SetInsertPoint(loopEnd);
-        irBuilder->CreateCall(printfFunc, {irBuilder->CreateGlobalStringPtr(separator)}); // Linea final
+        irBuilder->CreateCall(printfFunc, {irBuilder->CreateGlobalStringPtr(separator)}); 
         irBuilder->CreateCall(fcloseFunc, {filePtr});
         irBuilder->CreateBr(afterSelectBB);
 
         irBuilder->SetInsertPoint(afterSelectBB);
         return std::any();
     }
-
-    // En SQLMiniDriver.h
+    
     virtual std::any visitFunctionCall(SQLMiniParser::FunctionCallContext *ctx) override {
-        // Lógica para la función IF (MySQL)
-        // Sintaxis: IF(condicion, resultado_verdadero, resultado_falso)
+        if (!ctx->IF_FUNC()) return std::any(); 
 
-        if (ctx->IF_FUNC()) {
-            auto comparisonCtx = ctx->comparison();
-            auto trueDatoCtx = ctx->dato(1);
-            auto falseDatoCtx = ctx->dato(2);
+        Value* condition = compileComparison(ctx->comparison()); 
+        Value* trueVal = compileDato(ctx->dato(0)); 
+        Value* falseVal = compileDato(ctx->dato(1)); 
+        
+        Function *currentFunc = irBuilder->GetInsertBlock()->getParent();
+        BasicBlock *trueBB = BasicBlock::Create(context, "if_true", currentFunc);
+        BasicBlock *falseBB = BasicBlock::Create(context, "if_false", currentFunc);
+        BasicBlock *mergeBB = BasicBlock::Create(context, "if_merge", currentFunc);
 
-            // 1. Manejar la Comparación (Condición)
-            // Necesitarás una función auxiliar que compile la `comparison` a un I1 (booleano)
-            Value* condition = compileComparison(comparisonCtx); 
+        irBuilder->CreateCondBr(condition, trueBB, falseBB);
 
-            // 2. Generar bloques de control de flujo
-            Function *currentFunc = irBuilder->GetInsertBlock()->getParent();
-            BasicBlock *trueBB = BasicBlock::Create(context, "if_true", currentFunc);
-            BasicBlock *falseBB = BasicBlock::Create(context, "if_false", currentFunc);
-            BasicBlock *mergeBB = BasicBlock::Create(context, "if_merge", currentFunc);
+        irBuilder->SetInsertPoint(trueBB);
+        trueBB = irBuilder->GetInsertBlock();
+        irBuilder->CreateBr(mergeBB);
 
-            irBuilder->CreateCondBr(condition, trueBB, falseBB);
+        irBuilder->SetInsertPoint(falseBB);
+        falseBB = irBuilder->GetInsertBlock(); 
+        irBuilder->CreateBr(mergeBB);
 
-            // 3. Generar rama VERDADERA (TRUE)
-            irBuilder->SetInsertPoint(trueBB);
-            Value* trueVal = compileDato(trueDatoCtx); // Función auxiliar para compilar el dato
-            trueBB = irBuilder->GetInsertBlock(); // Actualizar bloque de salida
-            irBuilder->CreateBr(mergeBB);
+        irBuilder->SetInsertPoint(mergeBB);
+        PHINode *phi = irBuilder->CreatePHI(trueVal->getType(), 2, "if_result");
+        phi->addIncoming(trueVal, trueBB);
+        phi->addIncoming(falseVal, falseBB);
 
-            // 4. Generar rama FALSA (FALSE)
-            irBuilder->SetInsertPoint(falseBB);
-            Value* falseVal = compileDato(falseDatoCtx); 
-            falseBB = irBuilder->GetInsertBlock(); // Actualizar bloque de salida
-            irBuilder->CreateBr(mergeBB);
-
-            // 5. Generar bloque de UNIÓN (MERGE) con PHINode
-            irBuilder->SetInsertPoint(mergeBB);
-            // Asumimos que trueVal y falseVal tienen el mismo tipo (simplificación)
-            PHINode *phi = irBuilder->CreatePHI(trueVal->getType(), 2, "if_result");
-            phi->addIncoming(trueVal, trueBB);
-            phi->addIncoming(falseVal, falseBB);
-
-            return (Value*)phi;
-        }
-        return std::any(); // O manejar error
+        return (Value*)phi;
     }
 
     virtual std::any visitDrop(SQLMiniParser::DropContext *ctx) { return std::any(); }
 
-    // En SQLMiniDriver.h
     virtual std::any visitForLoop(SQLMiniParser::ForLoopContext *ctx) override {
-        // Sintaxis: FOR i = 1 TO 100 DO INSERT... END FOR;
-        std::string varName = ctx->ID()->getText(); // Nombre de la variable (e.g., 'i')
+        std::string varName = ctx->ID()->getText();
+        if (ctx->VINT().size() < 2) throw std::runtime_error("FOR loop error");
+        
         int startVal = std::stoi(ctx->VINT(0)->getText());
         int endVal = std::stoi(ctx->VINT(1)->getText());
 
         Function *currentFunc = irBuilder->GetInsertBlock()->getParent();
-
-        // 1. Inicialización: Crear una variable ALLOCA para el contador 'i'
         Value* loopVar = irBuilder->CreateAlloca(Type::getInt32Ty(context), nullptr, varName);
         Value* startConstant = ConstantInt::get(Type::getInt32Ty(context), startVal);
         irBuilder->CreateStore(startConstant, loopVar);
 
-        // 2. Bloques de control
         BasicBlock *loopCond = BasicBlock::Create(context, "for_cond", currentFunc);
         BasicBlock *loopBody = BasicBlock::Create(context, "for_body", currentFunc);
         BasicBlock *loopExit = BasicBlock::Create(context, "for_exit", currentFunc);
 
-        irBuilder->CreateBr(loopCond); // Saltar a la condición
-
-        // 3. Condición del bucle (loop_cond)
+        irBuilder->CreateBr(loopCond); 
+        
         irBuilder->SetInsertPoint(loopCond);
         Value* currentVal = irBuilder->CreateLoad(Type::getInt32Ty(context), loopVar);
         Value* endConstant = ConstantInt::get(Type::getInt32Ty(context), endVal);
-        // Comparación: i <= 100
         Value* condition = irBuilder->CreateICmpSLE(currentVal, endConstant, "loop_cond_val");
         irBuilder->CreateCondBr(condition, loopBody, loopExit);
 
-        // 4. Cuerpo del bucle (loop_body)
         irBuilder->SetInsertPoint(loopBody);
-
-        // Ejecutar el INSERT
-        // **IMPORTANTE**: Necesitas sobrecargar `visitInsert` o encapsular su lógica 
-        // para que tome el contexto del insert dentro del FOR.
-        // Por simplicidad: Llama a la lógica de `insert` directamente o haz un `visitInsert(ctx->insert())`.
         this->visitInsert(ctx->insert()); 
 
-        // 5. Incremento (i = i + 1)
         Value* stepVal = ConstantInt::get(Type::getInt32Ty(context), 1);
         Value* nextVal = irBuilder->CreateAdd(currentVal, stepVal, "next_i");
         irBuilder->CreateStore(nextVal, loopVar);
+        irBuilder->CreateBr(loopCond); 
 
-        irBuilder->CreateBr(loopCond); // Regresar a la condición
-
-        // 6. Fin del bucle (loop_exit)
         irBuilder->SetInsertPoint(loopExit);
-
         return std::any();
     }
 };
